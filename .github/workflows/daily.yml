@@ -17,7 +17,14 @@ jobs:
           python-version: '3.11'
 
       - name: Instalar dependências
-        run: pip install anthropic requests youtube-transcript-api
+        run: pip install anthropic requests youtube-transcript-api pysocks
+
+      - name: Instalar Tor
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y tor
+          sudo service tor start
+          sleep 5
 
       - name: Executar script
         env:
