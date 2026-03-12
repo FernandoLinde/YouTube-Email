@@ -77,7 +77,7 @@ def send_email(html):
     msg["From"]    = EMAIL_ADDRESS
     msg["To"]      = EMAIL_RECIPIENT
     msg.attach(MIMEText(html, "html"))
-    with smtplib.SMTP("smtp-mail.outlook.com", 587) as server:
+    with smtplib.SMTP("smtp.gmail.com", 587) as server:
         server.starttls()
         server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
         server.sendmail(EMAIL_ADDRESS, EMAIL_RECIPIENT, msg.as_string())
