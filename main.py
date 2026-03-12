@@ -8,6 +8,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from anthropic import Anthropic
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.proxies import GenericProxyConfig
 
 # ============================================================
 # CONFIG
@@ -47,28 +48,20 @@ def get_channel_videos(channel_id):
             })
         return videos
     except Exception as e:
-        print(f"  Erro ao buscar canal {channel_id}: {e}")
+        print(f"  Erro canal {channel_id}: {e}")
         return []
 
 # ============================================================
-# YOUTUBE: FETCH TRANSCRIPT (new v1.x API syntax)
+# YOUTUBE: FETCH TRANSCRIPT VIA TOR PROXY (free forever)
 # ============================================================
 def get_transcript(video_id):
     try:
-        from youtube_transcript_api.proxies import WebshareProxyConfig
-        proxy_user = os.environ.get("WEBSHARE_PROXY_USERNAME", "")
-        proxy_pass = os.environ.get("WEBSHARE_PROXY_PASSWORD", "")
-
-        if proxy_user and proxy_pass:
-            ytt = YouTubeTranscriptApi(
-                proxy_config=WebshareProxyConfig(
-                    proxy_username=proxy_user,
-                    proxy_password=proxy_pass,
-                )
+        ytt = YouTubeTranscriptApi(
+            proxy_config=GenericProxyConfig(
+                http_url="socks5://127.0.0.1:9050",
+                https_url="socks5://127.0.0.1:9050",
             )
-        else:
-            ytt = YouTubeTranscriptApi()
-
+        )
         transcript = ytt.fetch(video_id, languages=["pt", "en", "es", "pt-BR"])
         text = " ".join([s.text for s in transcript.snippets])
         return text[:MAX_TRANSCRIPT_CHARS]
@@ -86,18 +79,18 @@ def summarize(video, transcript, prompt):
         f"TITULO: {video['title']}\n"
         f"CANAL: {video['channel']}\n\n"
         f"{content}\n\n"
-        f"Responda APENAS com um JSON valido (sem markdown, sem backticks, sem texto extra):\n"
-        f'{{"resumo": "2-3 frases concisas sobre o conteudo.", '
+        f"Responda APENAS com JSON valido (sem markdown, sem backticks, sem texto extra):\n"
+        f'{{"resumo": "2-3 frases concisas.", '
         f'"pontos": ["Ponto 1", "Ponto 2", "Ponto 3"], '
         f'"recomendacao": "IMPERDIVEL ou VALE ASSISTIR ou INFORMATIVO", '
-        f'"motivo": "Uma frase explicando a recomendacao."}}'
+        f'"motivo": "Uma frase curta explicando a recomendacao."}}'
     )
     try:
-        message = client.messages.create(
+        msg = client.messages.create(
             model=MODEL, max_tokens=1000,
             messages=[{"role": "user", "content": full_prompt}]
         )
-        text = message.content[0].text.replace("```json", "").replace("```", "").strip()
+        text = msg.content[0].text.replace("```json", "").replace("```", "").strip()
         return json.loads(text)
     except Exception as e:
         print(f"  Erro Claude: {e}")
@@ -105,11 +98,11 @@ def summarize(video, transcript, prompt):
             print("  Rate limit — aguardando 60s...")
             time.sleep(60)
             try:
-                message = client.messages.create(
+                msg = client.messages.create(
                     model=MODEL, max_tokens=1000,
                     messages=[{"role": "user", "content": full_prompt}]
                 )
-                text = message.content[0].text.replace("```json", "").replace("```", "").strip()
+                text = msg.content[0].text.replace("```json", "").replace("```", "").strip()
                 return json.loads(text)
             except Exception:
                 pass
@@ -129,21 +122,21 @@ def summarize_without_transcript(video, prompt):
             duration = res["items"][0].get("contentDetails", {}).get("duration", "")
 
         full_prompt = (
-            f"Sem transcricao disponivel. Resuma baseado no titulo e descricao.\n\n"
+            f"Sem transcricao. Resuma baseado no titulo e descricao.\n\n"
             f"{prompt}\n\n"
             f"TITULO: {video['title']}\nCANAL: {video['channel']}\nDURACAO: {duration}\n"
             f"DESCRICAO:\n{description}\n\n"
-            f"Responda APENAS com um JSON valido (sem markdown, sem backticks, sem texto extra):\n"
+            f"Responda APENAS com JSON valido (sem markdown, sem backticks, sem texto extra):\n"
             f'{{"resumo": "2-3 frases concisas.", '
             f'"pontos": ["Ponto 1", "Ponto 2", "Ponto 3"], '
             f'"recomendacao": "IMPERDIVEL ou VALE ASSISTIR ou INFORMATIVO", '
-            f'"motivo": "Uma frase explicando a recomendacao."}}'
+            f'"motivo": "Uma frase curta explicando a recomendacao."}}'
         )
-        message = client.messages.create(
+        msg = client.messages.create(
             model=MODEL, max_tokens=1000,
             messages=[{"role": "user", "content": full_prompt}]
         )
-        text = message.content[0].text.replace("```json", "").replace("```", "").strip()
+        text = msg.content[0].text.replace("```json", "").replace("```", "").strip()
         return json.loads(text)
     except Exception as e:
         print(f"  Erro fallback: {e}")
@@ -216,7 +209,7 @@ def build_html(summaries, skipped):
     <p style="color:#BBDEFB;margin:2px 0 0;font-size:12px">{date_str} | {len(summaries)} resumos de {total} videos</p>
   </div>
   <div style="padding:12px">{content}</div>
-  <p style="text-align:center;color:#ccc;font-size:10px;padding:8px">GitHub Actions + Claude</p>
+  <p style="text-align:center;color:#ccc;font-size:10px;padding:8px">GitHub Actions + Claude + Tor</p>
 </div></body></html>"""
 
 # ============================================================
