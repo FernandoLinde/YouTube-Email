@@ -3,12 +3,20 @@ import smtplib
 import requests
 import time
 import json
+import re
+import html as html_lib
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from anthropic import Anthropic
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api.proxies import GenericProxyConfig
+
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi
+except ImportError:
+    YouTubeTranscriptApi = None
+
+import yt_dlp
 
 # ============================================================
 # CONFIG
@@ -22,6 +30,7 @@ EMAIL_RECIPIENT   = os.environ["EMAIL_RECIPIENT"]
 MODEL = "claude-haiku-4-5-20251001"
 MAX_TRANSCRIPT_CHARS = 100000
 LOOKBACK_HOURS = 48
+PREFERRED_LANGUAGES = ["pt-BR", "pt", "en", "en-US", "es"]
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -44,7 +53,7 @@ def get_channel_videos(channel_id):
                 "id":      item["id"]["videoId"],
                 "title":   item["snippet"]["title"],
                 "channel": item["snippet"]["channelTitle"],
-                "url":     f"https://youtube.com/watch?v={item['id']['videoId']}"
+                "url":     f"https://www.youtube.com/watch?v={item['id']['videoId']}"
             })
         return videos
     except Exception as e:
@@ -52,22 +61,174 @@ def get_channel_videos(channel_id):
         return []
 
 # ============================================================
-# YOUTUBE: FETCH TRANSCRIPT VIA TOR PROXY (free forever)
+# TRANSCRIPT: HELPER FUNCTIONS (from your working app)
 # ============================================================
-def get_transcript(video_id):
-    try:
-        ytt = YouTubeTranscriptApi(
-            proxy_config=GenericProxyConfig(
-                http_url="socks5://127.0.0.1:9050",
-                https_url="socks5://127.0.0.1:9050",
-            )
-        )
-        transcript = ytt.fetch(video_id, languages=["pt", "en", "es", "pt-BR"])
-        text = " ".join([s.text for s in transcript.snippets])
-        return text[:MAX_TRANSCRIPT_CHARS]
-    except Exception as e:
-        print(f"  Transcricao falhou: {e}")
+def _clean_text(raw_text):
+    text = html_lib.unescape(raw_text or "")
+    text = text.replace("\n", " ").replace("\r", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+def _join_segments(segments):
+    pieces = []
+    for seg in segments:
+        text = _clean_text(seg.get("text", ""))
+        if text:
+            pieces.append(text)
+    return " ".join(pieces).strip()
+
+def _choose_caption_tracks(caption_dict):
+    if not caption_dict:
+        return []
+    ordered = []
+    seen = set()
+
+    def push(track):
+        if not track:
+            return
+        track_key = track.get("url") or id(track)
+        if track_key not in seen:
+            ordered.append(track)
+            seen.add(track_key)
+
+    for wanted in PREFERRED_LANGUAGES:
+        for key, tracks in caption_dict.items():
+            if key.lower() == wanted.lower():
+                for track in tracks:
+                    push(track)
+
+    for wanted in PREFERRED_LANGUAGES:
+        for key, tracks in caption_dict.items():
+            if key.lower().startswith(wanted.lower().split("-")[0]):
+                for track in tracks:
+                    push(track)
+
+    for tracks in caption_dict.values():
+        for track in tracks:
+            push(track)
+
+    return ordered
+
+def _parse_caption_payload(payload, ext_hint):
+    ext = (ext_hint or "").lower()
+    stripped_payload = payload.lstrip()
+
+    if ext in {"json3", "srv3"} or stripped_payload.startswith("{"):
+        data = json.loads(payload)
+        events = data.get("events", [])
+        pieces = []
+        for event in events:
+            for seg in event.get("segs", []):
+                piece = _clean_text(seg.get("utf8", ""))
+                if piece:
+                    pieces.append(piece)
+        return " ".join(pieces).strip()
+
+    lines = []
+    for line in payload.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("WEBVTT"):
+            continue
+        if "-->" in stripped:
+            continue
+        if re.fullmatch(r"\d+", stripped):
+            continue
+        lines.append(_clean_text(stripped))
+    return " ".join(lines).strip()
+
+# ============================================================
+# TRANSCRIPT: METHOD 1 — youtube-transcript-api
+# ============================================================
+def _transcript_from_api(video_id):
+    if YouTubeTranscriptApi is None:
         return None
+
+    try:
+        api = YouTubeTranscriptApi()
+        if hasattr(api, "fetch"):
+            fetched = api.fetch(video_id, languages=PREFERRED_LANGUAGES)
+            if hasattr(fetched, "to_raw_data"):
+                raw_segments = fetched.to_raw_data()
+            else:
+                raw_segments = [
+                    {"text": getattr(item, "text", ""), "start": getattr(item, "start", 0), "duration": getattr(item, "duration", 0)}
+                    for item in fetched
+                ]
+            text = _join_segments(raw_segments)
+            return text if text else None
+        elif hasattr(YouTubeTranscriptApi, "get_transcript"):
+            raw_segments = YouTubeTranscriptApi.get_transcript(video_id, languages=PREFERRED_LANGUAGES)
+            text = _join_segments(raw_segments)
+            return text if text else None
+    except Exception as e:
+        print(f"    youtube-transcript-api falhou: {e}")
+    return None
+
+# ============================================================
+# TRANSCRIPT: METHOD 2 — yt-dlp (fallback that works on cloud)
+# ============================================================
+def _transcript_from_ytdlp(video_url):
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "ignoreerrors": True,
+        "skip_download": True,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+
+        if not info:
+            return None
+
+        for source_name, caption_dict in (
+            ("manual subtitles", info.get("subtitles") or {}),
+            ("auto captions", info.get("automatic_captions") or {}),
+        ):
+            tracks = _choose_caption_tracks(caption_dict)
+            for track in tracks:
+                caption_url = track.get("url")
+                ext_hint = track.get("ext")
+                if not caption_url:
+                    continue
+                try:
+                    with urllib.request.urlopen(caption_url, timeout=15) as response:
+                        payload = response.read().decode("utf-8", errors="ignore")
+                    text = _parse_caption_payload(payload, ext_hint)
+                    if text:
+                        print(f"    yt-dlp ({source_name}): {len(text)} chars")
+                        return text
+                except Exception as exc:
+                    print(f"    yt-dlp caption download falhou: {exc}")
+
+    except Exception as e:
+        print(f"    yt-dlp falhou: {e}")
+
+    return None
+
+# ============================================================
+# TRANSCRIPT: COMBINED (try API first, then yt-dlp)
+# ============================================================
+def get_transcript(video):
+    video_id = video["id"]
+    video_url = video["url"]
+
+    # Method 1: youtube-transcript-api
+    text = _transcript_from_api(video_id)
+    if text:
+        print(f"    Fonte: youtube-transcript-api ({len(text)} chars)")
+        return text[:MAX_TRANSCRIPT_CHARS]
+
+    # Method 2: yt-dlp fallback
+    text = _transcript_from_ytdlp(video_url)
+    if text:
+        return text[:MAX_TRANSCRIPT_CHARS]
+
+    print(f"    Sem transcricao disponivel")
+    return None
 
 # ============================================================
 # CLAUDE: SUMMARIZE + RECOMMEND
@@ -209,7 +370,7 @@ def build_html(summaries, skipped):
     <p style="color:#BBDEFB;margin:2px 0 0;font-size:12px">{date_str} | {len(summaries)} resumos de {total} videos</p>
   </div>
   <div style="padding:12px">{content}</div>
-  <p style="text-align:center;color:#ccc;font-size:10px;padding:8px">GitHub Actions + Claude + Tor</p>
+  <p style="text-align:center;color:#ccc;font-size:10px;padding:8px">GitHub Actions + Claude + yt-dlp</p>
 </div></body></html>"""
 
 # ============================================================
@@ -253,13 +414,11 @@ def main():
 
     for i, video in enumerate(all_videos):
         print(f"\n[{i+1}/{len(all_videos)}] {video['title']}")
-        transcript = get_transcript(video["id"])
+        transcript = get_transcript(video)
 
         if transcript:
-            print(f"  Transcricao: {len(transcript)} chars")
             result = summarize(video, transcript, prompt)
         else:
-            print(f"  Sem transcricao — fallback")
             result = summarize_without_transcript(video, prompt)
 
         if result:
