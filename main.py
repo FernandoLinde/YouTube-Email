@@ -55,7 +55,20 @@ def get_channel_videos(channel_id):
 # ============================================================
 def get_transcript(video_id):
     try:
-        ytt = YouTubeTranscriptApi()
+        from youtube_transcript_api.proxies import WebshareProxyConfig
+        proxy_user = os.environ.get("WEBSHARE_PROXY_USERNAME", "")
+        proxy_pass = os.environ.get("WEBSHARE_PROXY_PASSWORD", "")
+
+        if proxy_user and proxy_pass:
+            ytt = YouTubeTranscriptApi(
+                proxy_config=WebshareProxyConfig(
+                    proxy_username=proxy_user,
+                    proxy_password=proxy_pass,
+                )
+            )
+        else:
+            ytt = YouTubeTranscriptApi()
+
         transcript = ytt.fetch(video_id, languages=["pt", "en", "es", "pt-BR"])
         text = " ".join([s.text for s in transcript.snippets])
         return text[:MAX_TRANSCRIPT_CHARS]
